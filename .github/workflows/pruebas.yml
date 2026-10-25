@@ -1,0 +1,37 @@
+name: Pruebas de seguridad Firebase
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar archivos
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Instalar dependencias
+        run: |
+          npm init -y
+          npm install --no-save firebase @firebase/rules-unit-testing firebase-tools
+
+      - name: Crear configuracion del emulador
+        run: |
+          echo '{"firestore":{"rules":"firestore_corregido.rules"},"emulators":{"firestore":{"port":8080}}}' > firebase.json
+          echo 'rules_version = '\''2'\''; service cloud.firestore { match /databases/{database}/documents { match /{document=**} { allow read, write: if false; } } }' > firestore_corregido.rules
+
+      - name: Ejecutar pruebas
+        run: npx firebase emulators:exec --project demo-mp --only firestore "node --test"
