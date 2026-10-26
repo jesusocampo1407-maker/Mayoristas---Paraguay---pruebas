@@ -91,3 +91,22 @@ async function rechazar(id){if(!confirm('Borrar?'))return;await db.collection('n
 </script>
 </body>
 </html>
+/* --- SOLO LOGOS - TODOS COMO DAPAR --- */
+.business-image, 
+.logo-img,
+.card-img {
+  width: 100% !important;
+  height: 240px !important;
+  background: #fff;
+  overflow: hidden;
+  border-radius: 16px 16px 0 0;
+}
+
+.business-image img,
+.logo-img img,
+.card-img img {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  object-position: center !important;
+}
