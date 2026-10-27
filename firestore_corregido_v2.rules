@@ -1,0 +1,148 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Funciones ----------
+    function signedIn() { return request.auth != null; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function isAdmin()  { return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function profile()  { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function roleOf()   { return profile().role; }
+    function isModStatus(s) { return s in ['pending','approved','rejected']; }
+    function validName(n) { return n is string && n.size() >= 2 && n.size() <= 80; }
+    // Solo el administrador puede tocar estos campos de moderación
+    function onlyModeration() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','reviewedBy','reviewedAt'])
+        && isModStatus(request.resource.data.status);
+    }
+
+    // ---------- Administradores (se crean A MANO en la consola; nadie puede crearse admin) ----------
+    match /admins/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    // ---------- Perfiles ----------
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if false;
+      // Se crea justo después de registrarse (el correo aún no está verificado), por eso aquí no se exige verified().
+      // El rol solo puede ser buyer o provider: 'admin' no existe como rol.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','email','role','createdAt'])
+        && validName(request.resource.data.name)
+        && request.resource.data.role in ['buyer','provider']
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time;
+      // Solo se puede cambiar el nombre (nunca rol, correo ni fecha). El admin también puede corregir el nombre.
+      allow update: if signedIn() && (request.auth.uid == uid || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+        && validName(request.resource.data.name);
+      allow delete: if false;
+    }
+
+    // ---------- Negocios (id del documento = uid del mayorista) ----------
+    match /businessRequests/{uid} {
+      function validBiz(d) {
+        return d.name is string && d.name.size() >= 2 && d.name.size() <= 80
+          && d.ownerName is string && d.ownerName.size() >= 2 && d.ownerName.size() <= 80
+          && d.city is string && d.city.size() >= 2 && d.city.size() <= 60
+          && d.whatsapp is string && d.whatsapp.matches('^[0-9]{9,15}$')
+          && d.products is string && d.products.size() >= 3 && d.products.size() <= 500
+          && d.categories is list && d.categories.size() >= 1 && d.categories.size() <= 12
+          && d.shipping in ['pais','ciudades','local','consultar']
+          && d.shippingNotes is string && d.shippingNotes.size() <= 200
+          && d.instagram is string && d.instagram.matches('^[A-Za-z0-9._]{0,30}$')
+          && d.website is string && (d.website == '' || d.website.matches('^https?://.{3,190}$'))
+          && d.imports is bool && d.exports is bool;
+      }
+      // Dueño, administrador, o cualquier usuario verificado SOLO si el negocio está aprobado.
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin())
+        || (verified() && resource.data.status == 'approved');
+      // Listado: el admin ve todo; un usuario verificado solo puede pedir los aprobados
+      // (la consulta debe incluir where('status','==','approved')). Los pendientes de otros nunca.
+      allow list: if isAdmin() || (verified() && resource.data.status == 'approved');
+      allow create: if verified() && request.auth.uid == uid && roleOf() == 'provider'
+        && request.resource.data.keys().hasOnly(['ownerUid','name','ownerName','city','whatsapp','products','categories','shipping','shippingNotes','instagram','website','imports','exports','status','createdAt','updatedAt'])
+        && request.resource.data.ownerUid == uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validBiz(request.resource.data);
+      allow update:
+        // Mayorista: edita solo lo suyo, solo si NO está aprobado, y siempre queda en 'pending' (no puede aprobarse).
+        if (verified() && request.auth.uid == uid && roleOf() == 'provider'
+            && resource.data.status != 'approved'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','ownerName','city','whatsapp','products','categories','shipping','shippingNotes','instagram','website','imports','exports','status','updatedAt'])
+            && request.resource.data.status == 'pending'
+            && request.resource.data.updatedAt == request.time
+            && validBiz(request.resource.data))
+        // Administrador: solo campos de moderación.
+        || (isAdmin() && onlyModeration())
+        // Administrador: aplicar una solicitud de cambio aprobada (solo WhatsApp, descripción, Instagram, web). No cambia el estado.
+        || (isAdmin()
+            && request.resource.data.status == resource.data.status
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['whatsapp','products','instagram','website','updatedAt'])
+            && request.resource.data.updatedAt == request.time
+            && validBiz(request.resource.data));
+      allow delete: if false;
+    }
+
+    // ---------- Solicitudes de cambio (solo mayoristas con negocio APROBADO) ----------
+    match /changeRequests/{id} {
+      // 'changes' (opcional): solo estos 4 campos de contacto, con el mismo formato que en el negocio.
+      function validChanges(c) {
+        return c is map && c.keys().size() >= 1
+          && c.keys().hasOnly(['whatsapp','products','instagram','website'])
+          && (!('whatsapp' in c) || (c.whatsapp is string && c.whatsapp.matches('^[0-9]{9,15}$')))
+          && (!('products' in c) || (c.products is string && c.products.size() >= 3 && c.products.size() <= 500))
+          && (!('instagram' in c) || (c.instagram is string && c.instagram.matches('^[A-Za-z0-9._]{0,30}$')))
+          && (!('website' in c) || (c.website is string && (c.website == '' || c.website.matches('^https?://.{3,190}$'))));
+      }
+      allow create: if verified() && roleOf() == 'provider'
+        && exists(/databases/$(database)/documents/businessRequests/$(request.auth.uid))
+        && get(/databases/$(database)/documents/businessRequests/$(request.auth.uid)).data.status == 'approved'
+        && request.resource.data.keys().hasOnly(['ownerUid','message','status','createdAt','changes'])
+        && (!('changes' in request.resource.data) || validChanges(request.resource.data.changes))
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.message is string
+        && request.resource.data.message.size() >= 5 && request.resource.data.message.size() <= 500
+        && request.resource.data.createdAt == request.time;
+      allow get, list: if signedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+      allow update: if isAdmin() && onlyModeration();
+      allow delete: if false;
+    }
+
+    // ---------- Opiniones ----------
+    match /reviews/{rid} {
+      // Las aprobadas son públicas (el catálogo las muestra a cualquier visitante). Las pendientes/rechazadas: solo su autor y el admin.
+      allow get, list: if resource.data.status == 'approved'
+        || (signedIn() && resource.data.authorUid == request.auth.uid)
+        || isAdmin();
+      // Una por comprador y proveedor: el id del documento DEBE ser providerId_uid, así un segundo envío
+      // sería una escritura sobre un documento existente (update) y las reglas no la permiten.
+      allow create: if verified() && roleOf() == 'buyer'
+        && request.resource.data.keys().hasOnly(['providerId','rating','text','authorUid','authorName','authorType','verifiedPurchase','status','createdAt'])
+        && request.resource.data.providerId is string
+        && request.resource.data.providerId.matches('^[0-9]{9,15}$')
+        && rid == request.resource.data.providerId + '_' + request.auth.uid
+        && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() >= 1 && request.resource.data.authorName.size() <= 40
+        && request.resource.data.authorType == 'registered'
+        && request.resource.data.verifiedPurchase == false
+        && request.resource.data.status == 'pending'
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.text is string
+        && request.resource.data.text.size() >= 5 && request.resource.data.text.size() <= 600
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin() && onlyModeration();
+      allow delete: if (signedIn() && resource.data.authorUid == request.auth.uid) || isAdmin();
+    }
+
+    // ---------- Todo lo demás: denegado ----------
+    match /{document=**} { allow read, write: if false; }
+  }
+}
